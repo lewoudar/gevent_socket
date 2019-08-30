@@ -1,19 +1,40 @@
 import json
 from typing import Tuple
 
-from gevent import socket
+from gevent import socket, ssl
 from gevent.server import StreamServer
 from h2 import events
 from h2.config import H2Configuration
 from h2.connection import H2Connection
 
 
+# noinspection PyUnresolvedReferences
+def get_http2_tls_context() -> ssl.SSLContext:
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+    # RFC 7540 Section 9.2: Implementations of HTTP/2 MUST use TLS version 1.2
+    # or higher. Disable TLS 1.1 and lower.
+    ctx.options |= (
+            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+    )
+    # RFC 7540 Section 9.2.1: A deployment of HTTP/2 over TLS 1.2 MUST disable
+    # compression.
+    ctx.options |= ssl.OP_NO_COMPRESSION
+    ctx.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
+    ctx.load_cert_chain(certfile='localhost.crt', keyfile='localhost.key')
+    ctx.set_alpn_protocols(['h2'])
+    try:
+        ctx.set_npn_protocols(['h2'])
+    except NotImplementedError:
+        pass
+
+    return ctx
+
+
 class H2Worker:
 
     def __init__(self, sock: socket, address: Tuple[str, str]):
-        self._sock: socket = sock
-        # noinspection PyTypeChecker
-        self._address: Tuple[str, str] = address
+        self._sock = sock
+        self._address = address
         self._run()
 
     @staticmethod
@@ -62,5 +83,5 @@ class H2Worker:
         self._close()
 
 
-server = StreamServer(('127.0.0.1', 8080), H2Worker)
+server = StreamServer(('127.0.0.1', 8080), H2Worker, ssl_context=get_http2_tls_context(), server_side=True)
 server.serve_forever()
