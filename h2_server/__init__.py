@@ -70,10 +70,6 @@ class H2Worker:
         if not p.is_dir():
             raise NotADirectoryError(f'{sources_dir} does not exists')
 
-    def _close(self) -> None:
-        self._sock.shutdown(socket.SHUT_RDWR)
-        self._sock.close()
-
     def _send_error_response(self, status_code: str, event: events.RequestReceived) -> None:
         self._connection.send_headers(
             stream_id=event.stream_id,
@@ -184,14 +180,11 @@ class H2Worker:
             if data_to_send:
                 self._sock.sendall(data_to_send)
 
-        self._close()
-
 
 if __name__ == '__main__':
     files_dir = sys.argv[1] if len(sys.argv) > 1 else f'{Path().cwd()}'
     server = StreamServer(('127.0.0.1', 8080), partial(H2Worker, source_dir=files_dir),
-                          ssl_context=get_http2_tls_context(),
-                          server_side=True)
+                          ssl_context=get_http2_tls_context())
     try:
         server.serve_forever()
     except KeyboardInterrupt:
