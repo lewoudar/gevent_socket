@@ -2,16 +2,25 @@
 Simple websocket client
 """
 import re
-from typing import Callable, Tuple, List, Dict
+from enum import Enum
+from typing import Callable, Tuple, List, Dict, Any
 
-from gevent import socket
+from gevent import socket, Timeout
 from wsproto import WSConnection, ConnectionType
-from wsproto.events import Request, AcceptConnection, CloseConnection
+from wsproto.events import Event, Request, AcceptConnection, CloseConnection, Pong, Ping
 from wsproto.typing import Headers
+
+Callback = Callable[['Client', Event], Any]
+
+
+class EventType(Enum):
+    CONNECT = 'connect'
+    DISCONNECT = 'disconnect'
+    PONG = 'pong'
 
 
 class Client:
-    _callbacks: Dict[str, Callable] = {}
+    _callbacks: Dict[EventType, Callable] = {}
     receive_bytes = 65535
 
     # noinspection PyTypeChecker
@@ -76,6 +85,23 @@ class Client:
         if not isinstance(callback, callable):
             raise TypeError(f'{method} callback must be a callable')
 
+    @classmethod
+    def _on_callback(cls, event_type: EventType, func: Callback) -> Callback:
+        cls._callbacks[event_type] = func
+        return func
+
+    @classmethod
+    def on_connect(cls, func: Callback) -> Callback:
+        return cls._on_callback(EventType.CONNECT, func)
+
+    @classmethod
+    def on_disconnect(cls, func: Callback) -> Callback:
+        return cls._on_callback(EventType.DISCONNECT, func)
+
+    @classmethod
+    def on_pong(cls, func: Callback):
+        return cls._on_callback(EventType.PONG, func)
+
     def _establish_tcp_connection(self, host: str, port: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.connect((host, port))
@@ -96,9 +122,27 @@ class Client:
     def _handle_events(self):
         for event in self._ws.events():
             if isinstance(event, AcceptConnection):
-                print('connection established')
+                if EventType.CONNECT in self._callbacks:
+                    self._callbacks[EventType.CONNECT](self, event)
+
             if isinstance(event, CloseConnection):
-                print('connection terminated')
+                if EventType.DISCONNECT in self._callbacks:
+                    self._callbacks[EventType.DISCONNECT](self, event)
+
+            if isinstance(event, Pong):
+                if EventType.PONG in self._callbacks:
+                    self._callbacks[EventType.PONG](self, event)
+
+    def ping(self, data: bytes = b'ping', timeout: int = 3) -> None:
+        if not isinstance(data, bytes):
+            raise TypeError('data must be bytes')
+        if not isinstance(timeout, int):
+            raise TypeError('timeout must be an integer value')
+
+        with Timeout(timeout):
+            self._sock.sendall(self._ws.send(Ping(data)))
+            self._ws.receive_data(self._sock.recv(self.receive_bytes))
+        self._handle_events()
 
     def _close_ws_connection(self):
         close_data = self._ws.send(CloseConnection(code=1000, reason='nothing more to do'))
@@ -130,7 +174,22 @@ class Client:
 
 
 if __name__ == '__main__':
-    # client = Client('ws://localhost:8080/foo')
-    # client.close()
-    with Client('ws://localhost:8080/foo'):
-        pass
+    @Client.on_connect
+    def connect(_, event: AcceptConnection):
+        print('connection accepted')
+        print(event)
+
+
+    @Client.on_disconnect
+    def disconnect(_, event: CloseConnection):
+        print('connection closed')
+        print(event)
+
+
+    @Client.on_pong
+    def pong(_, event: Pong):
+        print('pong message:', event.payload)
+
+
+    with Client('ws://localhost:8080/foo') as client:
+        client.ping()
