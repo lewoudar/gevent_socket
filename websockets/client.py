@@ -5,8 +5,10 @@ import re
 from enum import Enum
 from typing import Callable, Tuple, List, Dict, Any
 
-from gevent import socket, Timeout
+from gevent import socket, spawn
+from gevent.event import Event as GEvent
 from wsproto import WSConnection, ConnectionType
+from wsproto.connection import ConnectionState
 from wsproto.events import Event, Request, AcceptConnection, CloseConnection, Pong, Ping
 from wsproto.typing import Headers
 
@@ -34,10 +36,14 @@ class Client:
         self._ws: WSConnection = None
         # wsproto does not seem to like empty path, so we provide an arbitrary one
         self._default_path = 'path'
+        self._running = True
+        self._handshake_finished = GEvent()
 
         host, port, path = self._get_connect_information(connect_uri)
         self._establish_tcp_connection(host, port)
         self._establish_websocket_handshake(host, path, headers, extensions, sub_protocols)
+
+        spawn(self._run)
 
     @staticmethod
     def _check_ws_headers(headers: Headers) -> None:
@@ -115,55 +121,47 @@ class Client:
         request = Request(host=host, target=path, extra_headers=headers, extensions=extensions,
                           subprotocols=sub_protocols)
         self._sock.sendall(self._ws.send(request))
-        in_data = self._sock.recv(self.receive_bytes)
-        self._ws.receive_data(in_data)
-        self._handle_events()
 
-    def _handle_events(self):
-        for event in self._ws.events():
-            if isinstance(event, AcceptConnection):
-                if EventType.CONNECT in self._callbacks:
-                    self._callbacks[EventType.CONNECT](self, event)
+    def _run(self) -> None:
+        while self._running:
+            data = self._sock.recv(self.receive_bytes)
+            self._ws.receive_data(data)
 
-            if isinstance(event, CloseConnection):
-                if EventType.DISCONNECT in self._callbacks:
-                    self._callbacks[EventType.DISCONNECT](self, event)
+            for event in self._ws.events():
+                if isinstance(event, AcceptConnection):
+                    self._handshake_finished.set()
+                    if EventType.CONNECT in self._callbacks:
+                        self._callbacks[EventType.CONNECT](self, event)
 
-            if isinstance(event, Pong):
-                if EventType.PONG in self._callbacks:
-                    self._callbacks[EventType.PONG](self, event)
+                if isinstance(event, CloseConnection):
+                    self._running = False
+                    if EventType.DISCONNECT in self._callbacks:
+                        self._callbacks[EventType.DISCONNECT](self, event)
+                    # if the server sends first a close connection we need to reply with another one
+                    if self._ws.state is ConnectionState.REMOTE_CLOSING:
+                        self._sock.sendall(self._ws.send(event.response()))
 
-    def ping(self, data: bytes = b'ping', timeout: int = 3) -> None:
+                if isinstance(event, Pong):
+                    if EventType.PONG in self._callbacks:
+                        self._callbacks[EventType.PONG](self, event)
+
+        self._sock.close()
+
+    def ping(self, data: bytes = b'hello') -> None:
+        self._handshake_finished.wait()
         if not isinstance(data, bytes):
             raise TypeError('data must be bytes')
-        if not isinstance(timeout, int):
-            raise TypeError('timeout must be an integer value')
 
-        with Timeout(timeout):
-            self._sock.sendall(self._ws.send(Ping(data)))
-            self._ws.receive_data(self._sock.recv(self.receive_bytes))
-        self._handle_events()
+        self._sock.sendall(self._ws.send(Ping(data)))
 
     def _close_ws_connection(self):
         close_data = self._ws.send(CloseConnection(code=1000, reason='nothing more to do'))
         self._sock.sendall(close_data)
 
-        self._ws.receive_data(self._sock.recv(self.receive_bytes))
-        self._handle_events()
-        self._sock.shutdown(socket.SHUT_WR)
-
-        in_data = self._sock.recv(self.receive_bytes)
-        if not in_data:
-            self._ws.receive_data(None)
-        else:
-            self._ws.receive_data(in_data)
-
-    def _close_socket(self) -> None:
-        self._sock.close()
-
     def close(self) -> None:
-        self._close_ws_connection()
-        self._close_socket()
+        self._handshake_finished.wait()
+        if self._ws.state is ConnectionState.OPEN:
+            self._close_ws_connection()
 
     def __enter__(self):
         return self
@@ -189,7 +187,6 @@ if __name__ == '__main__':
     @Client.on_pong
     def pong(_, event: Pong):
         print('pong message:', event.payload)
-
 
     with Client('ws://localhost:8080/foo') as client:
         client.ping()
