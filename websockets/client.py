@@ -1,15 +1,19 @@
 """
 Simple websocket client
 """
+import io
 import re
 from enum import Enum
-from typing import Callable, Tuple, List, Dict, Any, Union
+from typing import Callable, Tuple, List, Dict, Any, Union, AnyStr
 
 from gevent import socket, spawn
 from gevent.event import AsyncResult
 from wsproto import WSConnection, ConnectionType
 from wsproto.connection import ConnectionState
-from wsproto.events import Event, Request, AcceptConnection, CloseConnection, Pong, Ping, RejectConnection, RejectData
+from wsproto.events import (
+    Event, Request, AcceptConnection, CloseConnection, Pong, Ping, RejectConnection, RejectData, TextMessage,
+    BytesMessage, Message
+)
 from wsproto.typing import Headers
 from wsproto.utilities import ProtocolError
 
@@ -23,6 +27,8 @@ class EventType(Enum):
     CONNECT = 'connect'
     DISCONNECT = 'disconnect'
     PONG = 'pong'
+    TEXT_MESSAGE = 'text'
+    BINARY_MESSAGE = 'binary'
 
 
 class ConnectionRejectedError(ProtocolError):
@@ -40,6 +46,7 @@ class ConnectionRejectedError(ProtocolError):
 class Client:
     _callbacks: Dict[EventType, Callable] = {}
     receive_bytes: int = 65535
+    buffer_size: int = io.DEFAULT_BUFFER_SIZE
 
     # noinspection PyTypeChecker
     def __init__(self, connect_uri: str, headers: Headers = None, extensions: List[str] = None,
@@ -121,8 +128,16 @@ class Client:
         return cls._on_callback(EventType.DISCONNECT, func)
 
     @classmethod
-    def on_pong(cls, func: BytesCallback):
+    def on_pong(cls, func: BytesCallback) -> BytesCallback:
         return cls._on_callback(EventType.PONG, func)
+
+    @classmethod
+    def on_text_message(cls, func: StrCallback) -> StrCallback:
+        return cls._on_callback(EventType.TEXT_MESSAGE, func)
+
+    @classmethod
+    def on_binary_message(cls, func: BytesCallback) -> BytesCallback:
+        return cls._on_callback(EventType.BINARY_MESSAGE, func)
 
     def _establish_tcp_connection(self, host: str, port: int) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -142,6 +157,8 @@ class Client:
         reject_data = bytearray()
         reject_status_code = 400
         reject_headers = []
+        text_message = []
+        byte_message = bytearray()
 
         while self._running:
             data = self._sock.recv(self.receive_bytes)
@@ -185,6 +202,20 @@ class Client:
                     if EventType.PONG in self._callbacks:
                         self._callbacks[EventType.PONG](event.payload)
 
+                if isinstance(event, TextMessage):
+                    text_message.append(event.data)
+                    if event.message_finished:
+                        if EventType.TEXT_MESSAGE in self._callbacks:
+                            self._callbacks[EventType.TEXT_MESSAGE](''.join(text_message))
+                        text_message.clear()
+
+                if isinstance(event, BytesMessage):
+                    byte_message.extend(event.data)
+                    if event.message_finished:
+                        if EventType.BINARY_MESSAGE in self._callbacks:
+                            self._callbacks[EventType.BINARY_MESSAGE](byte_message)
+                        byte_message.clear()
+
         self._sock.close()
 
     def ping(self, data: bytes = b'hello') -> None:
@@ -193,6 +224,29 @@ class Client:
             raise TypeError('data must be bytes')
 
         self._sock.sendall(self._ws.send(Ping(data)))
+
+    def _send_data(self, data: AnyStr) -> None:
+        if isinstance(data, str):
+            io_object = io.StringIO(data)
+        else:
+            io_object = io.BytesIO(data)
+
+        with io_object as f:
+            chunk = f.read(self.buffer_size)
+            while chunk:
+                if len(chunk) < self.buffer_size:
+                    self._sock.sendall(self._ws.send(Message(data, message_finished=True)))
+                    break
+                else:
+                    self._sock.sendall(self._ws.send(Message(data, message_finished=False)))
+                chunk = f.read(self.buffer_size)
+
+    def send(self, data: AnyStr) -> None:
+        self._handshake_finished.get()
+        if not isinstance(data, (bytes, str)):
+            raise TypeError('data must be bytes or string')
+
+        self._send_data(data)
 
     def _close_ws_connection(self):
         close_data = self._ws.send(CloseConnection(code=1000, reason='nothing more to do'))
@@ -228,5 +282,16 @@ if __name__ == '__main__':
         print('pong message:', payload)
 
 
+    @Client.on_text_message
+    def handle_text_message(payload):
+        print(payload)
+
+
+    @Client.on_binary_message
+    def handle_binary_message(payload):
+        print(payload)
+
+
     with Client('ws://localhost:8080/foo') as client:
         client.ping()
+        client.send('gr' * 5000)
