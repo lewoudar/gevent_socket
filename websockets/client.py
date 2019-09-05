@@ -3,16 +3,20 @@ Simple websocket client
 """
 import re
 from enum import Enum
-from typing import Callable, Tuple, List, Dict, Any
+from typing import Callable, Tuple, List, Dict, Any, Union
 
 from gevent import socket, spawn
-from gevent.event import Event as GEvent
+from gevent.event import AsyncResult
 from wsproto import WSConnection, ConnectionType
 from wsproto.connection import ConnectionState
-from wsproto.events import Event, Request, AcceptConnection, CloseConnection, Pong, Ping
+from wsproto.events import Event, Request, AcceptConnection, CloseConnection, Pong, Ping, RejectConnection, RejectData
 from wsproto.typing import Headers
+from wsproto.utilities import ProtocolError
 
-Callback = Callable[['Client', Event], Any]
+EventCallback = Callable[['Client', Event], Any]
+StrCallback = Callable[[str], Any]
+BytesCallback = Callable[[bytes], Any]
+Callback = Union[EventCallback, StrCallback, BytesCallback]
 
 
 class EventType(Enum):
@@ -21,9 +25,21 @@ class EventType(Enum):
     PONG = 'pong'
 
 
+class ConnectionRejectedError(ProtocolError):
+    """Exception raised when the client receives the event RejectConnection"""
+
+    def __init__(self, status_code: int, headers: Headers, reason: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self.reason = reason
+
+    def __str__(self):
+        return f'status = {self.status_code}, headers = {self.headers}, reason = {self.reason}'
+
+
 class Client:
     _callbacks: Dict[EventType, Callable] = {}
-    receive_bytes = 65535
+    receive_bytes: int = 65535
 
     # noinspection PyTypeChecker
     def __init__(self, connect_uri: str, headers: Headers = None, extensions: List[str] = None,
@@ -37,7 +53,7 @@ class Client:
         # wsproto does not seem to like empty path, so we provide an arbitrary one
         self._default_path = 'path'
         self._running = True
-        self._handshake_finished = GEvent()
+        self._handshake_finished = AsyncResult()
 
         host, port, path = self._get_connect_information(connect_uri)
         self._establish_tcp_connection(host, port)
@@ -97,15 +113,15 @@ class Client:
         return func
 
     @classmethod
-    def on_connect(cls, func: Callback) -> Callback:
+    def on_connect(cls, func: EventCallback) -> EventCallback:
         return cls._on_callback(EventType.CONNECT, func)
 
     @classmethod
-    def on_disconnect(cls, func: Callback) -> Callback:
+    def on_disconnect(cls, func: EventCallback) -> EventCallback:
         return cls._on_callback(EventType.DISCONNECT, func)
 
     @classmethod
-    def on_pong(cls, func: Callback):
+    def on_pong(cls, func: BytesCallback):
         return cls._on_callback(EventType.PONG, func)
 
     def _establish_tcp_connection(self, host: str, port: int) -> None:
@@ -123,6 +139,10 @@ class Client:
         self._sock.sendall(self._ws.send(request))
 
     def _run(self) -> None:
+        reject_data = bytearray()
+        reject_status_code = 400
+        reject_headers = []
+
         while self._running:
             data = self._sock.recv(self.receive_bytes)
             self._ws.receive_data(data)
@@ -132,6 +152,26 @@ class Client:
                     self._handshake_finished.set()
                     if EventType.CONNECT in self._callbacks:
                         self._callbacks[EventType.CONNECT](self, event)
+
+                if isinstance(event, RejectConnection):
+                    if not event.has_body:
+                        self._handshake_finished.set_exception(
+                            ConnectionRejectedError(event.status_code, event.headers, reject_data)
+                        )
+                        self._running = False
+                        break
+                    else:
+                        reject_status_code = event.status_code
+                        reject_headers = event.headers
+
+                if isinstance(event, RejectData):
+                    reject_data.extend(event.data)
+                    if event.body_finished:
+                        self._handshake_finished.set_exception(
+                            ConnectionRejectedError(reject_status_code, reject_headers, reject_data)
+                        )
+                        self._running = False
+                        break
 
                 if isinstance(event, CloseConnection):
                     self._running = False
@@ -143,12 +183,12 @@ class Client:
 
                 if isinstance(event, Pong):
                     if EventType.PONG in self._callbacks:
-                        self._callbacks[EventType.PONG](self, event)
+                        self._callbacks[EventType.PONG](event.payload)
 
         self._sock.close()
 
     def ping(self, data: bytes = b'hello') -> None:
-        self._handshake_finished.wait()
+        self._handshake_finished.get()
         if not isinstance(data, bytes):
             raise TypeError('data must be bytes')
 
@@ -159,7 +199,7 @@ class Client:
         self._sock.sendall(close_data)
 
     def close(self) -> None:
-        self._handshake_finished.wait()
+        self._handshake_finished.get()
         if self._ws.state is ConnectionState.OPEN:
             self._close_ws_connection()
 
@@ -168,7 +208,6 @@ class Client:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-        return True
 
 
 if __name__ == '__main__':
@@ -185,8 +224,9 @@ if __name__ == '__main__':
 
 
     @Client.on_pong
-    def pong(_, event: Pong):
-        print('pong message:', event.payload)
+    def pong(payload):
+        print('pong message:', payload)
+
 
     with Client('ws://localhost:8080/foo') as client:
         client.ping()
