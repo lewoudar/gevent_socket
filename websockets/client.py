@@ -2,6 +2,7 @@
 Simple websocket client
 """
 import io
+import json
 import re
 from enum import Enum
 from typing import Callable, Tuple, List, Dict, Any, Union, AnyStr
@@ -20,13 +21,15 @@ from wsproto.utilities import ProtocolError
 EventCallback = Callable[['Client', Event], Any]
 StrCallback = Callable[[str], Any]
 BytesCallback = Callable[[bytes], Any]
-Callback = Union[EventCallback, StrCallback, BytesCallback]
+JsonCallback = Callable[[Any], Any]
+Callback = Union[EventCallback, StrCallback, BytesCallback, JsonCallback]
 
 
 class EventType(Enum):
     CONNECT = 'connect'
     DISCONNECT = 'disconnect'
     PONG = 'pong'
+    JSON_MESSAGE = 'json'
     TEXT_MESSAGE = 'text'
     BINARY_MESSAGE = 'binary'
 
@@ -58,7 +61,7 @@ class Client:
         self._sock: socket = None
         self._ws: WSConnection = None
         # wsproto does not seem to like empty path, so we provide an arbitrary one
-        self._default_path = 'path'
+        self._default_path = '/'
         self._running = True
         self._handshake_finished = AsyncResult()
 
@@ -136,6 +139,10 @@ class Client:
         return cls._on_callback(EventType.TEXT_MESSAGE, func)
 
     @classmethod
+    def on_json_message(cls, func: JsonCallback) -> JsonCallback:
+        return cls._on_callback(EventType.JSON_MESSAGE, func)
+
+    @classmethod
     def on_binary_message(cls, func: BytesCallback) -> BytesCallback:
         return cls._on_callback(EventType.BINARY_MESSAGE, func)
 
@@ -205,6 +212,14 @@ class Client:
                 if isinstance(event, TextMessage):
                     text_message.append(event.data)
                     if event.message_finished:
+                        if EventType.JSON_MESSAGE in self._callbacks:
+                            str_message = ''.join(text_message)
+                            try:
+                                self._callbacks[EventType.JSON_MESSAGE](json.loads(str_message))
+                                text_message.clear()
+                                continue  # no need to process text handler if json handler already does the job
+                            except json.JSONDecodeError:
+                                pass
                         if EventType.TEXT_MESSAGE in self._callbacks:
                             self._callbacks[EventType.TEXT_MESSAGE](''.join(text_message))
                         text_message.clear()
@@ -247,6 +262,9 @@ class Client:
             raise TypeError('data must be bytes or string')
 
         self._send_data(data)
+
+    def send_json(self, data: Any) -> None:
+        self.send(json.dumps(data))
 
     def _close_ws_connection(self):
         close_data = self._ws.send(CloseConnection(code=1000, reason='nothing more to do'))
@@ -294,4 +312,6 @@ if __name__ == '__main__':
 
     with Client('ws://localhost:8080/foo') as client:
         client.ping()
-        client.send('gr' * 5000)
+        client.send_json({'hello': 'world'})
+        client.send('my name is Kevin')
+        client.send(b'just some bytes for testing purpose')
