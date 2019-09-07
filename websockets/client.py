@@ -61,7 +61,7 @@ class Client:
         self._sock: socket = None
         self._ws: WSConnection = None
         # wsproto does not seem to like empty path, so we provide an arbitrary one
-        self._default_path = '/'
+        self._default_path = '/path'
         self._running = True
         self._handshake_finished = AsyncResult()
 
@@ -69,7 +69,7 @@ class Client:
         self._establish_tcp_connection(host, port)
         self._establish_websocket_handshake(host, path, headers, extensions, sub_protocols)
 
-        spawn(self._run)
+        self._green = spawn(self._run)
 
     @staticmethod
     def _check_ws_headers(headers: Headers) -> None:
@@ -169,6 +169,8 @@ class Client:
 
         while self._running:
             data = self._sock.recv(self.receive_bytes)
+            if not data:
+                data = None
             self._ws.receive_data(data)
 
             for event in self._ws.events():
@@ -274,6 +276,8 @@ class Client:
         self._handshake_finished.get()
         if self._ws.state is ConnectionState.OPEN:
             self._close_ws_connection()
+        # don't forget to join the run greenlet, if not, you will have some surprises with your event handlers!
+        self._green.join()
 
     def __enter__(self):
         return self
@@ -300,14 +304,18 @@ if __name__ == '__main__':
         print('pong message:', payload)
 
 
+    @Client.on_json_message
+    def handle_json_message(payload):
+        print('json message:', payload)
+
     @Client.on_text_message
     def handle_text_message(payload):
-        print(payload)
+        print('text message:', payload)
 
 
     @Client.on_binary_message
     def handle_binary_message(payload):
-        print(payload)
+        print('binary message:', payload)
 
 
     with Client('ws://localhost:8080/foo') as client:
