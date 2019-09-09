@@ -1,6 +1,6 @@
 # gevent socket
 
-Just playing with gevent, socket, h2 and ws_proto.
+Just playing with gevent, socket, h2 and wsproto.
 May be later I will finalize it in a package..
 
 The project contains:
