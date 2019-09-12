@@ -28,6 +28,7 @@ Callback = Union[EventCallback, StrCallback, BytesCallback, JsonCallback]
 class EventType(Enum):
     CONNECT = 'connect'
     DISCONNECT = 'disconnect'
+    PING = 'ping'
     PONG = 'pong'
     JSON_MESSAGE = 'json'
     TEXT_MESSAGE = 'text'
@@ -131,6 +132,10 @@ class Client:
         return cls._on_callback(EventType.DISCONNECT, func)
 
     @classmethod
+    def on_ping(cls, func: BytesCallback) -> BytesCallback:
+        return cls._on_callback(EventType.PING, func)
+
+    @classmethod
     def on_pong(cls, func: BytesCallback) -> BytesCallback:
         return cls._on_callback(EventType.PONG, func)
 
@@ -202,10 +207,15 @@ class Client:
                 if isinstance(event, CloseConnection):
                     self._running = False
                     if EventType.DISCONNECT in self._callbacks:
-                        self._callbacks[EventType.DISCONNECT](self, event)
+                        self._callbacks[EventType.DISCONNECT](event)
                     # if the server sends first a close connection we need to reply with another one
                     if self._ws.state is ConnectionState.REMOTE_CLOSING:
                         self._sock.sendall(self._ws.send(event.response()))
+
+                if isinstance(event, Ping):
+                    if EventType.PING in self._callbacks:
+                        self._callbacks[EventType.PING](event.payload)
+                    self._sock.sendall(self._ws.send(event.response()))
 
                 if isinstance(event, Pong):
                     if EventType.PONG in self._callbacks:
@@ -217,20 +227,20 @@ class Client:
                         if EventType.JSON_MESSAGE in self._callbacks:
                             str_message = ''.join(text_message)
                             try:
-                                self._callbacks[EventType.JSON_MESSAGE](json.loads(str_message))
+                                self._callbacks[EventType.JSON_MESSAGE](self, json.loads(str_message))
                                 text_message.clear()
                                 continue  # no need to process text handler if json handler already does the job
                             except json.JSONDecodeError:
                                 pass
                         if EventType.TEXT_MESSAGE in self._callbacks:
-                            self._callbacks[EventType.TEXT_MESSAGE](''.join(text_message))
+                            self._callbacks[EventType.TEXT_MESSAGE](self, ''.join(text_message))
                         text_message.clear()
 
                 if isinstance(event, BytesMessage):
                     byte_message.extend(event.data)
                     if event.message_finished:
                         if EventType.BINARY_MESSAGE in self._callbacks:
-                            self._callbacks[EventType.BINARY_MESSAGE](byte_message)
+                            self._callbacks[EventType.BINARY_MESSAGE](self, byte_message)
                         byte_message.clear()
 
         self._sock.close()
@@ -288,33 +298,39 @@ class Client:
 
 if __name__ == '__main__':
     @Client.on_connect
-    def connect(_, event: AcceptConnection):
+    def connect(_, event: AcceptConnection) -> None:
         print('connection accepted')
         print(event)
 
 
     @Client.on_disconnect
-    def disconnect(_, event: CloseConnection):
+    def disconnect(event: CloseConnection) -> None:
         print('connection closed')
         print(event)
 
 
+    @Client.on_ping
+    def ping(payload: bytes) -> None:
+        print('ping message:', payload)
+
+
     @Client.on_pong
-    def pong(payload):
+    def pong(payload: bytes) -> None:
         print('pong message:', payload)
 
 
     @Client.on_json_message
-    def handle_json_message(payload):
+    def handle_json_message(_, payload: Any) -> None:
         print('json message:', payload)
 
+
     @Client.on_text_message
-    def handle_text_message(payload):
+    def handle_text_message(_, payload: str) -> None:
         print('text message:', payload)
 
 
     @Client.on_binary_message
-    def handle_binary_message(payload):
+    def handle_binary_message(_, payload: bytearray) -> None:
         print('binary message:', payload)
 
 

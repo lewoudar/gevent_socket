@@ -2,7 +2,6 @@ import io
 import json
 import sys
 from abc import ABC, abstractmethod
-# from socket import socket
 from typing import Tuple, AnyStr, Any
 
 from gevent import socket
@@ -11,7 +10,7 @@ from wsproto import WSConnection, ConnectionType
 from wsproto.connection import ConnectionState
 from wsproto.events import (
     Request, AcceptConnection, RejectConnection, RejectData, CloseConnection, Message,
-    TextMessage, BytesMessage, Ping
+    TextMessage, BytesMessage, Ping, Pong
 )
 from wsproto.typing import Headers
 
@@ -98,6 +97,10 @@ class BaseServer(ABC):
     def receive_bytes(self, data: bytes) -> None:
         pass
 
+    @abstractmethod
+    def handle_pong(self, data: bytes) -> None:
+        pass
+
     def _send_data(self, data: AnyStr) -> None:
         if isinstance(data, str):
             io_object = io.StringIO(data)
@@ -159,6 +162,9 @@ class BaseServer(ABC):
                 elif isinstance(event, Ping):
                     self._handle_ping(event)
 
+                elif isinstance(event, Pong):
+                    self.handle_pong(event.payload)
+
                 elif isinstance(event, TextMessage):
                     text_message.append(event.data)
                     if event.message_finished:
@@ -194,8 +200,14 @@ if __name__ == '__main__':
                 return
             self.accept_request()
 
+        def handle_pong(self, data: bytes) -> None:
+            print(data)
+
         def receive_bytes(self, data: bytes) -> None:
             print('receive bytes:', data)
+            if b'ping me' in data:  # this is only to demonstrate the usage of ping
+                self.ping(b'I ping you!')
+                return
             self.send(data)
 
         def receive_text(self, data: str) -> None:
