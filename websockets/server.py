@@ -1,19 +1,24 @@
+import io
+import json
 import sys
 from abc import ABC, abstractmethod
 # from socket import socket
-from typing import Tuple, AnyStr
+from typing import Tuple, AnyStr, Any
 
 from gevent import socket
 from gevent.server import StreamServer
 from wsproto import WSConnection, ConnectionType
 from wsproto.connection import ConnectionState
-from wsproto.events import Request, AcceptConnection, RejectConnection, RejectData, CloseConnection, Message, \
+from wsproto.events import (
+    Request, AcceptConnection, RejectConnection, RejectData, CloseConnection, Message,
     TextMessage, BytesMessage, Ping
+)
 from wsproto.typing import Headers
 
 
 class BaseServer(ABC):
     bytes_to_receive: int = 65535
+    buffer_size: int = io.DEFAULT_BUFFER_SIZE
 
     # noinspection PyTypeChecker
     def __init__(self, host: str, port: int):
@@ -73,7 +78,6 @@ class BaseServer(ABC):
             raise TypeError('reason must be a string')
 
         self._client.sendall(self._ws.send(CloseConnection(code, reason)))
-        self._running = False
 
     def _handle_close_event(self, event: CloseConnection) -> None:
         if self._ws.state is ConnectionState.REMOTE_CLOSING:
@@ -83,18 +87,47 @@ class BaseServer(ABC):
         self._client.sendall(self._ws.send(event.response()))
 
     @abstractmethod
-    def receive_text(self, text_data: str) -> None:
+    def receive_text(self, data: str) -> None:
         pass
 
     @abstractmethod
-    def receive_bytes(self, binary_data: bytes) -> None:
+    def receive_json(self, data: Any) -> None:
         pass
+
+    @abstractmethod
+    def receive_bytes(self, data: bytes) -> None:
+        pass
+
+    def _send_data(self, data: AnyStr) -> None:
+        if isinstance(data, str):
+            io_object = io.StringIO(data)
+        else:
+            io_object = io.BytesIO(data)
+
+        with io_object as f:
+            chunk = f.read(self.buffer_size)
+            while chunk:
+                if len(chunk) < self.buffer_size:
+                    self._client.sendall(self._ws.send(Message(data, message_finished=True)))
+                    break
+                else:
+                    self._client.sendall(self._ws.send(Message(data, message_finished=False)))
+                chunk = f.read(self.buffer_size)
+
+    def ping(self, data: bytes = b'hello') -> None:
+        if not isinstance(data, bytes):
+            raise TypeError('data must be bytes')
+
+        self._client.sendall(self._ws.send(Ping(data)))
 
     def send(self, data: AnyStr) -> None:
         if not isinstance(data, (bytes, str)):
             raise TypeError('data must be either a string or binary data')
 
-        self._client.sendall(self._ws.send(Message(data)))
+        self._send_data(data)
+
+    def send_json(self, data: Any) -> None:
+        self.send(json.dumps(data))
 
     @staticmethod
     def _check_init_arguments(host: str, port: int) -> None:
@@ -108,6 +141,8 @@ class BaseServer(ABC):
 
     def _handler(self, client: socket, address: Tuple[str, int]) -> None:
         self._client = client
+        text_message = []
+        binary_message = bytearray()
 
         while self._running:
             data = client.recv(self.bytes_to_receive)
@@ -116,15 +151,29 @@ class BaseServer(ABC):
             for event in self._ws.events():
                 if isinstance(event, Request):
                     self.handle_request(event)
+
                 elif isinstance(event, CloseConnection):
                     self._handle_close_event(event)
                     self._running = False
+
                 elif isinstance(event, Ping):
                     self._handle_ping(event)
+
                 elif isinstance(event, TextMessage):
-                    self.receive_text(event.data)
+                    text_message.append(event.data)
+                    if event.message_finished:
+                        str_data = ''.join(text_message)
+                        try:
+                            self.receive_json(json.loads(str_data))
+                        except json.JSONDecodeError:
+                            self.receive_text(str_data)
+                        text_message.clear()
+
                 elif isinstance(event, BytesMessage):
-                    self.receive_bytes(event.data)
+                    binary_message.extend(event.data)
+                    if event.message_finished:
+                        self.receive_bytes(bytes(binary_message))
+                        binary_message.clear()
                 else:
                     print('unknown event:', event)
 
@@ -140,16 +189,24 @@ class BaseServer(ABC):
 if __name__ == '__main__':
     class Server(BaseServer):
         def handle_request(self, request: Request) -> None:
-            if request.subprotocols:
+            if request.subprotocols:  # this is only to demonstrate the usage of reject_request
                 self.reject_request(reason='the server does not handle subprotocols')
                 return
             self.accept_request()
 
-        def receive_bytes(self, binary_data: bytes) -> None:
-            self.send(binary_data)
+        def receive_bytes(self, data: bytes) -> None:
+            print('receive bytes:', data)
+            self.send(data)
 
-        def receive_text(self, text_data: str) -> None:
-            self.send(text_data)
+        def receive_text(self, data: str) -> None:
+            print('receive text:', data)
+            self.send(data)
+            if 'bye' in data:  # this is only to demonstrate the usage of close_request
+                self.close_request(1001, 'bye!')
+
+        def receive_json(self, data: Any) -> None:
+            print('receive json:', data)
+            self.send_json(data)
 
 
     server = None
