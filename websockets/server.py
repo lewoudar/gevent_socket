@@ -220,7 +220,6 @@ if __name__ == '__main__':
             print('receive json:', data)
             self.send_json(data)
 
-
     server = None
     try:
         hostname = sys.argv[1] if len(sys.argv) > 1 else '127.0.0.1'
